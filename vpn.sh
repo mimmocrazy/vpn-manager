@@ -1,37 +1,70 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🛡️ OpenVPN Modern Manager CLI
+# :: Universal VPN Modern Manager CLI (OpenVPN & WireGuard)
 # ==============================================================================
 
 SCRIPT_NAME="$(basename "$0")"
 REAL_SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$REAL_SCRIPT_PATH")" && pwd)"
-VPN_DIR="/home/mimmo/VPNs"
-[ ! -d "$VPN_DIR" ] && VPN_DIR="$SCRIPT_DIR"
+
+# Detect real user & home directory even when executed via sudo
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6)"
+[ -z "$REAL_HOME" ] && REAL_HOME="${HOME:-/home/$REAL_USER}"
+
+# Automatically locate VPN directory (~/VPNs, ~/vpns, ~/vpn, etc.)
+VPN_DIR=""
+for candidate in "$REAL_HOME/VPNs" "$REAL_HOME/vpns" "$REAL_HOME/vpn" "$REAL_HOME/VPN" "$REAL_HOME/OpenVPN" "$REAL_HOME/wireguard" "$REAL_HOME/WireGuard"; do
+    if [ -d "$candidate" ]; then
+        VPN_DIR="$candidate"
+        break
+    fi
+done
+[ -z "$VPN_DIR" ] && VPN_DIR="$REAL_HOME/VPNs"
 
 LOG_FILE="/tmp/openvpn.log"
 PID_FILE="/tmp/openvpn.pid"
-CONF_FILE="/tmp/openvpn.conf"
+CONF_FILE="/tmp/vpn_manager.conf"
+TYPE_FILE="/tmp/vpn_manager.type"
+IFACE_FILE="/tmp/vpn_manager.iface"
 
-# ANSI Color Palette (Modern 256-color & Styled)
+# Palette inspired by command-not-found / modern terminal aesthetics
 RESET='\033[0m'
 BOLD='\033[1m'
 DIM='\033[2m'
 ITALIC='\033[3m'
 
 # Colors
-C_PRIMARY='\033[38;5;39m'     # Electric Blue / Cyan
-C_ACCENT='\033[38;5;141m'     # Soft Purple
-C_SUCCESS='\033[38;5;48m'     # Emerald Green
-C_WARN='\033[38;5;214m'       # Amber Orange
-C_DANGER='\033[38;5;203m'     # Coral Red
-C_MUTED='\033[38;5;244m'      # Dim Gray
-C_BG_DARK='\033[48;5;236m'    # Dark gray background
-C_WHITE='\033[38;5;255m'      # Bright White
+C_PREFIX='\033[1;38;5;111m'    # Pastel Periwinkle Blue (::)
+C_ACCENT='\033[1;38;5;141m'    # Soft Lavender (indexes [1], arrows ➜, badges)
+C_TITLE='\033[1;38;5;255m'     # Crisp White Bold
+C_TEXT='\033[38;5;189m'        # Soft Ice Lavender text
+C_SUCCESS='\033[38;5;150m'     # Soft Mint Green (✔, online)
+C_WARN='\033[38;5;222m'        # Warm Amber (configs, highlights)
+C_DANGER='\033[38;5;203m'      # Pastel Coral / Rose (✖, offline, alerts)
+C_MUTED='\033[38;5;60m'        # Deep Slate (brackets, hints, meta)
+C_SUBTLE='\033[38;5;103m'      # Medium Slate (labels)
+C_DIM='\033[38;5;241m'         # Dim Slate / Gray (paths, secondary)
+
+format_path() {
+    local p="$1"
+    if [ -n "$REAL_HOME" ] && [[ "$p" == "$REAL_HOME"* ]]; then
+        echo "~${p#"$REAL_HOME"}"
+    elif [ -n "$HOME" ] && [[ "$p" == "$HOME"* ]]; then
+        echo "~${p#"$HOME"}"
+    else
+        echo "$p"
+    fi
+}
+
+wait_key() {
+    echo ""
+    read -rsn1 -p "  Press any key to continue..." _
+    echo ""
+}
 
 print_banner() {
-    echo -e "${C_PRIMARY}${BOLD}🛡️  OPENVPN MANAGER${RESET}  ${C_MUTED}•  CLI Control Hub${RESET}"
-    echo -e "${C_MUTED}─────────────────────────────────────────────────────────────${RESET}"
+    echo -e "\n ${C_PREFIX}::${RESET} ${C_TITLE}VPN Manager${RESET} ${C_MUTED}(control hub)${RESET}\n"
 }
 
 check_root() {
@@ -52,7 +85,30 @@ if [ "$EUID" -ne 0 ]; then
     esac
 fi
 
-get_vpn_pid() {
+is_wireguard_file() {
+    local f="$1"
+    if [[ "$f" == *.conf ]]; then
+        if grep -qiE '^\s*\[(Interface|Peer)\]' "$f" 2>/dev/null; then
+            return 0
+        fi
+        # If inside /etc/wireguard
+        if [[ "$f" == *"/wireguard/"* ]] || [[ "$f" == *"/WireGuard/"* ]]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+get_file_protocol() {
+    local f="$1"
+    if is_wireguard_file "$f" || [[ "$f" == *.conf ]]; then
+        echo "WireGuard"
+    else
+        echo "OpenVPN"
+    fi
+}
+
+get_openvpn_pid() {
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
         cat "$PID_FILE"
     else
@@ -60,12 +116,12 @@ get_vpn_pid() {
     fi
 }
 
-get_vpn_config() {
+get_openvpn_config() {
     local pid="$1"
     if [ -f "$CONF_FILE" ]; then
         local saved_cfg
         saved_cfg=$(cat "$CONF_FILE" 2>/dev/null)
-        if [ -n "$saved_cfg" ]; then
+        if [ -n "$saved_cfg" ] && [[ "$saved_cfg" == *.ovpn ]]; then
             echo "$saved_cfg"
             return
         fi
@@ -84,192 +140,374 @@ get_vpn_config() {
     echo ""
 }
 
-get_vpn_ip() {
-    ip -4 addr show dev tun0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || echo ""
+get_wireguard_interfaces() {
+    if command -v wg >/dev/null 2>&1; then
+        wg show interfaces 2>/dev/null
+    else
+        ip -br link show type wireguard 2>/dev/null | awk '{print $1}'
+    fi
+}
+
+get_iface_ip() {
+    local iface="$1"
+    if [ -n "$iface" ]; then
+        ip -4 addr show dev "$iface" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1
+    fi
+}
+
+get_active_status() {
+    # Check WireGuard first
+    local wg_ifaces
+    wg_ifaces=$(get_wireguard_interfaces)
+    if [ -n "$wg_ifaces" ]; then
+        local first_wg
+        first_wg=$(echo "$wg_ifaces" | awk '{print $1}')
+        local wg_ip
+        wg_ip=$(get_iface_ip "$first_wg")
+        [ -z "$wg_ip" ] && wg_ip="active"
+        
+        local cfg_path
+        if [ -f "$CONF_FILE" ] && [[ "$(cat "$TYPE_FILE" 2>/dev/null)" == "wireguard" ]]; then
+            cfg_path=$(cat "$CONF_FILE" 2>/dev/null)
+        fi
+        [ -z "$cfg_path" ] && cfg_path="$first_wg.conf"
+
+        echo "WIREGUARD|$first_wg|$wg_ip|$cfg_path"
+        return
+    fi
+
+    # Check OpenVPN
+    local ovpn_pid
+    ovpn_pid=$(get_openvpn_pid)
+    if [ -n "$ovpn_pid" ]; then
+        local ovpn_ip
+        ovpn_ip=$(ip -4 addr show dev tun0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        if [ -z "$ovpn_ip" ]; then
+            ovpn_ip=$(ip -4 addr 2>/dev/null | grep -B2 'tun' | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+        fi
+        [ -z "$ovpn_ip" ] && ovpn_ip="waiting for IP..."
+        
+        local ovpn_cfg
+        ovpn_cfg=$(get_openvpn_config "$ovpn_pid")
+        echo "OPENVPN|tun0|$ovpn_ip|$ovpn_cfg|$ovpn_pid"
+        return
+    fi
+
+    echo "OFFLINE"
 }
 
 status_vpn() {
-    local pid
-    pid=$(get_vpn_pid)
+    local status_info
+    status_info=$(get_active_status)
     
-    echo -e "${C_ACCENT}${BOLD}STATO TUNNEL${RESET}"
-    echo -e "${C_MUTED}─────────────────────────────────────────────────────────────${RESET}"
-    if [ -n "$pid" ]; then
-        local ip cfg
-        ip=$(get_vpn_ip)
-        cfg=$(get_vpn_config "$pid")
-        [ -z "$ip" ] && ip="In attesa IP..."
+    local proto="${status_info%%|*}"
+    if [ "$proto" = "WIREGUARD" ]; then
+        local iface ip cfg
+        IFS='|' read -r _ iface ip cfg <<< "$status_info"
+        local pretty_cfg
+        pretty_cfg=$(format_path "$cfg")
         
-        echo -e "  ${C_SUCCESS}${BOLD}● Stato${RESET}        : ${C_SUCCESS}${BOLD}ONLINE${RESET}"
+        echo -e "   ${C_SUBTLE}Status${RESET}        ${C_SUCCESS}● online${RESET} ${C_MUTED}(WireGuard)${RESET}"
+        echo -e "   ${C_SUBTLE}Config${RESET}        ${C_WARN}$(basename "$cfg")${RESET} ${C_DIM}($pretty_cfg)${RESET}"
+        echo -e "   ${C_SUBTLE}Tunnel IP${RESET}     ${C_PREFIX}${BOLD}$ip${RESET} ${C_MUTED}($iface)${RESET}"
+        echo -e "   ${C_SUBTLE}Interface${RESET}     ${C_DIM}$iface${RESET}"
+    elif [ "$proto" = "OPENVPN" ]; then
+        local iface ip cfg pid
+        IFS='|' read -r _ iface ip cfg pid <<< "$status_info"
+        local pretty_cfg
+        pretty_cfg=$(format_path "$cfg")
+
+        echo -e "   ${C_SUBTLE}Status${RESET}        ${C_SUCCESS}● online${RESET} ${C_MUTED}(OpenVPN)${RESET}"
         if [ -n "$cfg" ]; then
-            echo -e "  ${C_WARN}⚙ Config${RESET}       : ${C_WARN}${BOLD}$(basename "$cfg")${RESET}"
-            if [ "$(basename "$cfg")" != "$cfg" ]; then
-                echo -e "  ${C_MUTED}📍 Percorso${RESET}    : ${C_MUTED}$cfg${RESET}"
-            fi
+            echo -e "   ${C_SUBTLE}Config${RESET}        ${C_WARN}$(basename "$cfg")${RESET} ${C_DIM}($pretty_cfg)${RESET}"
         fi
-        echo -e "  ${C_WHITE}🌐 Interfaccia${RESET} : ${BOLD}tun0${RESET}"
-        echo -e "  ${C_PRIMARY}🎯 IP Tunnel${RESET}   : ${C_PRIMARY}${BOLD}$ip${RESET}"
-        echo -e "  ${C_MUTED}🆔 Processo${RESET}    : ${C_MUTED}PID $pid${RESET}"
-        echo -e "  ${C_MUTED}📜 File Log${RESET}    : ${C_MUTED}$LOG_FILE${RESET}"
+        echo -e "   ${C_SUBTLE}Tunnel IP${RESET}     ${C_PREFIX}${BOLD}$ip${RESET} ${C_MUTED}($iface)${RESET}"
+        echo -e "   ${C_SUBTLE}Process${RESET}       ${C_DIM}PID $pid${RESET}"
     else
-        echo -e "  ${C_DANGER}${BOLD}○ Stato${RESET}        : ${C_DANGER}${BOLD}OFFLINE${RESET} ${C_MUTED}(Nessuna connessione attiva)${RESET}"
+        echo -e "   ${C_SUBTLE}Status${RESET}        ${C_DANGER}○ offline${RESET} ${C_MUTED}(no active tunnel)${RESET}"
     fi
-    echo -e "${C_MUTED}─────────────────────────────────────────────────────────────${RESET}"
 }
 
 stop_vpn() {
+    local any_stopped=false
+
+    # 1. Stop WireGuard tunnels
+    local wg_ifaces
+    wg_ifaces=$(get_wireguard_interfaces)
+    if [ -n "$wg_ifaces" ]; then
+        for iface in $wg_ifaces; do
+            echo -e "  ${C_ACCENT}➜${RESET} Disconnecting WireGuard ${C_MUTED}($iface)${RESET}..."
+            local cfg_to_down="$iface"
+            if [ -f "$CONF_FILE" ] && [[ "$(cat "$TYPE_FILE" 2>/dev/null)" == "wireguard" ]]; then
+                cfg_to_down="$(cat "$CONF_FILE" 2>/dev/null)"
+            fi
+            wg-quick down "$cfg_to_down" 2>/dev/null || wg-quick down "$iface" 2>/dev/null || ip link del dev "$iface" 2>/dev/null
+        done
+        any_stopped=true
+    fi
+
+    # 2. Stop OpenVPN tunnel
     local pid
-    pid=$(get_vpn_pid)
-    
+    pid=$(get_openvpn_pid)
     if [ -n "$pid" ]; then
-        echo -e "${C_WARN}⚡ Disconnessione in corso (PID: $pid)...${RESET}"
+        echo -e "  ${C_ACCENT}➜${RESET} Disconnecting OpenVPN ${C_MUTED}(PID: $pid)${RESET}..."
         kill "$pid" 2>/dev/null || pkill -x openvpn
-        sleep 1
-        
-        # Force kill if still lingering
+        sleep 0.5
         if pgrep -x openvpn >/dev/null; then
             killall -9 openvpn 2>/dev/null
         fi
-        
-        rm -f "$PID_FILE" "$CONF_FILE"
-        echo -e "${C_SUCCESS}✔ VPN disconnessa con successo.${RESET}"
+        any_stopped=true
+    fi
+
+    # Cleanup state
+    rm -f "$PID_FILE" "$CONF_FILE" "$TYPE_FILE" "$IFACE_FILE"
+
+    if [ "$any_stopped" = true ]; then
+        echo -e "  ${C_SUCCESS}✔${RESET} VPN disconnected successfully."
     else
-        rm -f "$PID_FILE" "$CONF_FILE"
-        echo -e "${C_MUTED}○ Nessuna VPN attiva da disconnettere.${RESET}"
+        echo -e "  ${C_MUTED}○ No active VPN to disconnect.${RESET}"
     fi
 }
 
 start_vpn() {
     local config_file="$1"
 
-    # If no config provided, show a styled picker of .ovpn files
+    # If no config provided, show a styled picker of .ovpn & .conf files
     if [ -z "$config_file" ]; then
-        # Search in VPN_DIR and current dir
-        local search_dirs=("$VPN_DIR")
-        [ "$(pwd)" != "$VPN_DIR" ] && [ "$(pwd)" != "$SCRIPT_DIR" ] && search_dirs+=("$(pwd)")
+        local search_dirs=()
+        for d in "$REAL_HOME/VPNs" "$REAL_HOME/vpns" "$REAL_HOME/vpn" "$REAL_HOME/VPN" "$REAL_HOME/OpenVPN" "$REAL_HOME/wireguard" "$REAL_HOME/WireGuard" "$VPN_DIR" "/etc/wireguard" "$(pwd)" "$SCRIPT_DIR"; do
+            if [ -d "$d" ]; then
+                search_dirs+=("$d")
+            fi
+        done
 
-        mapfile -t ovpn_files < <(
+        mapfile -t all_files < <(
             for d in "${search_dirs[@]}"; do
-                [ -d "$d" ] && find "$d" -maxdepth 1 -name "*.ovpn" -printf "%p\n"
+                find "$d" -maxdepth 2 \( -name "*.ovpn" -o -name "*.conf" \) -printf "%p\n" 2>/dev/null
             done | sort -u
         )
-        
-        if [ ${#ovpn_files[@]} -eq 0 ]; then
-            echo -e "${C_DANGER}✖ Nessun file .ovpn trovato in: ${BOLD}$VPN_DIR${RESET}"
-            return 1
-        fi
 
-        echo -e "\n${C_ACCENT}📁 Configurazioni disponibili in $VPN_DIR:${RESET}"
-        echo -e "${C_MUTED}─────────────────────────────────────────────────────────────${RESET}"
-        for i in "${!ovpn_files[@]}"; do
-            echo -e "  ${C_PRIMARY}${BOLD}$((i+1))${RESET} ${C_MUTED}❯${RESET} ${C_WHITE}$(basename "${ovpn_files[$i]}")${RESET}"
+        # Filter valid VPN config files
+        local valid_files=()
+        for f in "${all_files[@]}"; do
+            if [[ "$f" == *.ovpn ]]; then
+                valid_files+=("$f")
+            elif is_wireguard_file "$f"; then
+                valid_files+=("$f")
+            fi
         done
-        echo -e "${C_MUTED}─────────────────────────────────────────────────────────────${RESET}"
         
-        read -rp "👉 Seleziona numero [1-${#ovpn_files[@]}]: " choice
-
-        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#ovpn_files[@]}" ]; then
-            echo -e "${C_DANGER}✖ Selezione non valida.${RESET}"
+        if [ ${#valid_files[@]} -eq 0 ]; then
+            echo -e "\n  ${C_DANGER}✖${RESET} No VPN files (.ovpn / .conf) found in: ${BOLD}$(format_path "$VPN_DIR")${RESET}\n"
             return 1
         fi
 
-        config_file="${ovpn_files[$((choice-1))]}"
+        echo -e "\n ${C_PREFIX}::${RESET} ${BOLD}Available configurations${RESET} ${C_MUTED}($(format_path "$VPN_DIR"))${RESET}:\n"
+        for i in "${!valid_files[@]}"; do
+            local fn proto_badge
+            fn="$(basename "${valid_files[$i]}")"
+            proto_badge="$(get_file_protocol "${valid_files[$i]}")"
+            printf "   ${C_ACCENT}[$((i+1))]${RESET}  ${C_WARN}%-36s${RESET} ${C_MUTED}(%s)${RESET}\n" "$fn" "$proto_badge"
+        done
+        echo -e "   ${C_ACCENT}[q]${RESET}  ${C_MUTED}Cancel${RESET}\n"
+        
+        local choice
+        if [ "${#valid_files[@]}" -le 9 ]; then
+            read -rn1 -p " ➜ Select configuration [1-${#valid_files[@]}, q]: " choice
+            echo ""
+        else
+            read -rp " ➜ Select configuration [1-${#valid_files[@]}, q]: " choice
+        fi
+
+        # Allow q, Q, 0, empty, or ESC key to cancel
+        if [[ "$choice" =~ ^[qQ]$ ]] || [ -z "$choice" ] || [ "$choice" = "0" ] || [[ "$choice" == $'\e'* ]]; then
+            return 0
+        fi
+
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#valid_files[@]}" ]; then
+            echo -e "\n  ${C_DANGER}✖${RESET} Invalid selection."
+            return 1
+        fi
+
+        config_file="${valid_files[$((choice-1))]}"
     fi
 
-    # Resolve file path with smart fallbacks (.ovpn extension, VPN_DIR, PWD)
+    # Resolve file path with smart fallbacks (.ovpn, .conf extensions, candidate dirs, PWD)
     if [ ! -f "$config_file" ]; then
         if [ -f "$config_file.ovpn" ]; then
             config_file="$config_file.ovpn"
-        elif [ -f "$VPN_DIR/$config_file" ]; then
-            config_file="$VPN_DIR/$config_file"
-        elif [ -f "$VPN_DIR/$config_file.ovpn" ]; then
-            config_file="$VPN_DIR/$config_file.ovpn"
-        elif [ -f "$(pwd)/$config_file" ]; then
-            config_file="$(pwd)/$config_file"
-        elif [ -f "$(pwd)/$config_file.ovpn" ]; then
-            config_file="$(pwd)/$config_file.ovpn"
-        elif [ -f "$SCRIPT_DIR/$config_file" ]; then
-            config_file="$SCRIPT_DIR/$config_file"
-        elif [ -f "$SCRIPT_DIR/$config_file.ovpn" ]; then
-            config_file="$SCRIPT_DIR/$config_file.ovpn"
+        elif [ -f "$config_file.conf" ]; then
+            config_file="$config_file.conf"
         else
-            echo -e "${C_DANGER}✖ File di configurazione non trovato: ${BOLD}$config_file${RESET}"
-            return 1
+            local found=""
+            for d in "$REAL_HOME/VPNs" "$REAL_HOME/vpns" "$REAL_HOME/vpn" "$REAL_HOME/VPN" "$REAL_HOME/OpenVPN" "$REAL_HOME/wireguard" "$REAL_HOME/WireGuard" "$VPN_DIR" "/etc/wireguard" "$(pwd)" "$SCRIPT_DIR"; do
+                if [ -f "$d/$config_file" ]; then
+                    found="$d/$config_file"
+                    break
+                elif [ -f "$d/$config_file.ovpn" ]; then
+                    found="$d/$config_file.ovpn"
+                    break
+                elif [ -f "$d/$config_file.conf" ]; then
+                    found="$d/$config_file.conf"
+                    break
+                fi
+            done
+            if [ -n "$found" ]; then
+                config_file="$found"
+            else
+                echo -e "\n  ${C_DANGER}✖${RESET} Configuration file not found: ${BOLD}$config_file${RESET}\n"
+                return 1
+            fi
         fi
     fi
 
-    # Auto-stop if currently connected
-    local existing_pid
-    existing_pid=$(get_vpn_pid)
-    if [ -n "$existing_pid" ]; then
-        echo -e "${C_WARN}⚡ VPN già in esecuzione. Riavvio in corso...${RESET}"
+    local proto
+    proto="$(get_file_protocol "$config_file")"
+
+    # Stop any existing VPN
+    local current_status
+    current_status=$(get_active_status)
+    if [ "$current_status" != "OFFLINE" ]; then
+        echo -e "\n  ${C_WARN}➜${RESET} Active tunnel detected. Restarting..."
         stop_vpn
         sleep 1
     fi
 
-    echo -e "\n${C_PRIMARY}🚀 Avvio tunnel con: ${BOLD}$(basename "$config_file")${RESET}"
-    > "$LOG_FILE"
-    chmod 666 "$LOG_FILE" 2>/dev/null
-    echo "$config_file" > "$CONF_FILE"
-    chmod 666 "$CONF_FILE" 2>/dev/null
-
-    openvpn --config "$config_file" \
-            --daemon \
-            --writepid "$PID_FILE" \
-            --log "$LOG_FILE"
-
-    echo -ne "${C_MUTED}⏳ Connessione in corso... ${RESET}"
-    local count=0
-    local connected=false
-    local spinner=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-
-    while [ $count -lt 18 ]; do
-        local spin_idx=$((count % ${#spinner[@]}))
-        echo -ne "\b${C_PRIMARY}${spinner[$spin_idx]}${RESET}"
-        sleep 1
-        ((count++))
-        if grep -q "Initialization Sequence Completed" "$LOG_FILE" 2>/dev/null; then
-            connected=true
-            break
+    if [ "$proto" = "WireGuard" ]; then
+        # ----------------- WIREGUARD LAUNCH -----------------
+        if ! command -v wg-quick >/dev/null 2>&1; then
+            echo -e "\n  ${C_DANGER}✖${RESET} 'wg-quick' not found. Install wireguard-tools."
+            return 1
         fi
-        if ! pgrep -x openvpn >/dev/null; then
-            break
-        fi
-    done
-    echo -ne "\b \b\n"
 
-    if [ "$connected" = true ]; then
-        local ip
-        ip=$(get_vpn_ip)
-        echo -e "${C_SUCCESS}${BOLD}✔ Connessione stabilita con successo!${RESET}\n"
-        status_vpn
+        local iface_name
+        iface_name="$(basename "$config_file" .conf)"
+
+        echo -e "\n  ${C_ACCENT}➜${RESET} Starting WireGuard tunnel: ${C_WARN}${BOLD}$(basename "$config_file")${RESET}"
+        
+        echo "$config_file" > "$CONF_FILE"
+        chmod 666 "$CONF_FILE" 2>/dev/null
+        echo "wireguard" > "$TYPE_FILE"
+        chmod 666 "$TYPE_FILE" 2>/dev/null
+        echo "$iface_name" > "$IFACE_FILE"
+        chmod 666 "$IFACE_FILE" 2>/dev/null
+
+        local wg_out
+        if wg_out=$(wg-quick up "$config_file" 2>&1); then
+            sleep 0.5
+            local wg_ip
+            wg_ip=$(get_iface_ip "$iface_name")
+            [ -z "$wg_ip" ] && wg_ip="connected"
+            echo -e "  ${C_SUCCESS}✔${RESET} ${C_SUCCESS}${BOLD}WireGuard connected successfully!${RESET} ${C_MUTED}($wg_ip)${RESET}\n"
+            status_vpn
+        else
+            echo -e "  ${C_DANGER}✖${RESET} ${C_DANGER}${BOLD}WireGuard connection failed.${RESET}\n"
+            echo -e "   ${C_SUBTLE}Error output:${RESET}"
+            echo -e "   ${C_DIM}──────────────────────────────────────────────────${RESET}"
+            echo "$wg_out" | while IFS= read -r l; do echo -e "     ${C_MUTED}$l${RESET}"; done
+            echo -e "   ${C_DIM}──────────────────────────────────────────────────${RESET}"
+            rm -f "$CONF_FILE" "$TYPE_FILE" "$IFACE_FILE"
+            return 1
+        fi
+
     else
-        echo -e "${C_DANGER}${BOLD}✖ Connessione fallita o timeout raggiunto.${RESET}"
-        echo -e "${C_WARN}Ultime righe del file di log (${LOG_FILE}):${RESET}"
-        echo -e "${C_MUTED}-------------------------------------------------------------${RESET}"
-        tail -n 8 "$LOG_FILE" 2>/dev/null
-        echo -e "${C_MUTED}-------------------------------------------------------------${RESET}"
+        # ------------------ OPENVPN LAUNCH ------------------
+        if ! command -v openvpn >/dev/null 2>&1; then
+            echo -e "\n  ${C_DANGER}✖${RESET} 'openvpn' binary not found."
+            return 1
+        fi
+
+        echo -e "\n  ${C_ACCENT}➜${RESET} Starting OpenVPN tunnel: ${C_WARN}${BOLD}$(basename "$config_file")${RESET}"
+        > "$LOG_FILE"
+        chmod 666 "$LOG_FILE" 2>/dev/null
+        echo "$config_file" > "$CONF_FILE"
+        chmod 666 "$CONF_FILE" 2>/dev/null
+        echo "openvpn" > "$TYPE_FILE"
+        chmod 666 "$TYPE_FILE" 2>/dev/null
+
+        openvpn --config "$config_file" \
+                --daemon \
+                --writepid "$PID_FILE" \
+                --log "$LOG_FILE"
+
+        echo -ne "  ${C_MUTED}⏳ Connecting... ${RESET}"
+        local count=0
+        local connected=false
+        local spinner=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+
+        while [ $count -lt 18 ]; do
+            local spin_idx=$((count % ${#spinner[@]}))
+            echo -ne "\b${C_PREFIX}${spinner[$spin_idx]}${RESET}"
+            sleep 1
+            ((count++))
+            if grep -q "Initialization Sequence Completed" "$LOG_FILE" 2>/dev/null; then
+                connected=true
+                break
+            fi
+            if ! pgrep -x openvpn >/dev/null; then
+                break
+            fi
+        done
+        echo -ne "\b \b\n"
+
+        if [ "$connected" = true ]; then
+            local ip
+            ip=$(get_iface_ip "tun0")
+            [ -z "$ip" ] && ip=$(ip -4 addr 2>/dev/null | grep -B2 'tun' | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+            echo -e "  ${C_SUCCESS}✔${RESET} ${C_SUCCESS}${BOLD}OpenVPN connected successfully!${RESET} ${C_MUTED}($ip)${RESET}\n"
+            status_vpn
+        else
+            echo -e "  ${C_DANGER}✖${RESET} ${C_DANGER}${BOLD}Connection failed or timed out.${RESET}\n"
+            echo -e "   ${C_SUBTLE}Recent log entries (${LOG_FILE}):${RESET}"
+            echo -e "   ${C_DIM}──────────────────────────────────────────────────${RESET}"
+            while IFS= read -r line; do
+                echo -e "     ${C_MUTED}$line${RESET}"
+            done < <(tail -n 8 "$LOG_FILE" 2>/dev/null)
+            echo -e "   ${C_DIM}──────────────────────────────────────────────────${RESET}"
+        fi
     fi
 }
 
 show_logs() {
-    if [ ! -f "$LOG_FILE" ]; then
-        echo -e "${C_MUTED}○ Nessun log presente in $LOG_FILE${RESET}"
-        read -rp "Premi INVIO per tornare..."
+    local status_info
+    status_info=$(get_active_status)
+    local proto="${status_info%%|*}"
+
+    if [ "$proto" = "WIREGUARD" ]; then
+        local iface ip cfg
+        IFS='|' read -r _ iface ip cfg <<< "$status_info"
+        echo -e "\n ${C_PREFIX}::${RESET} ${BOLD}WireGuard Interface Status${RESET} ${C_MUTED}($iface)${RESET}"
+        echo -e "    ${C_MUTED}Press any key or [Ctrl+C] to return${RESET}\n"
+        
+        if command -v wg >/dev/null 2>&1; then
+            wg show "$iface" 2>/dev/null | while IFS= read -r line; do
+                echo -e "   ${C_TEXT}$line${RESET}"
+            done
+        else
+            ip -d link show "$iface" 2>/dev/null
+        fi
+        wait_key
         return
     fi
-    echo -e "${C_PRIMARY}📜 Streaming log in tempo reale (${LOG_FILE})${RESET}"
-    echo -e "${C_MUTED}👉 Premi [INVIO] o [Ctrl+C] per tornare al menu${RESET}\n"
+
+    if [ ! -f "$LOG_FILE" ]; then
+        echo -e "\n  ${C_MUTED}○ No logs found in $LOG_FILE${RESET}"
+        wait_key
+        return
+    fi
+
+    echo -e "\n ${C_PREFIX}::${RESET} ${BOLD}Live log stream${RESET} ${C_MUTED}($LOG_FILE)${RESET}"
+    echo -e "    ${C_MUTED}Press [Enter], [q] or [Ctrl+C] to return${RESET}\n"
 
     # Start tail in background
     tail -n 30 -f "$LOG_FILE" &
     local tail_pid=$!
 
     # Trap Ctrl+C so it gracefully kills tail and returns to menu
-    trap 'kill "$tail_pid" 2>/dev/null; trap - INT; echo -e "\n${C_SUCCESS}✔ Ritorno al menu in corso...${RESET}"; sleep 0.5; return 0' INT
+    trap 'kill "$tail_pid" 2>/dev/null; trap - INT; sleep 0.2; return 0' INT
 
-    # Allow pressing Enter to return as well
-    read -r _ < /dev/tty 2>/dev/null || wait "$tail_pid" 2>/dev/null
+    # Single keypress or Enter to exit log view
+    read -rsn1 _ < /dev/tty 2>/dev/null || wait "$tail_pid" 2>/dev/null
 
     kill "$tail_pid" 2>/dev/null
     trap - INT
@@ -279,44 +517,45 @@ interactive_menu() {
     while true; do
         clear
         print_banner
-        echo ""
         status_vpn
         echo ""
-        echo -e "${C_ACCENT}${BOLD}AZIONI DISPONIBILI${RESET}"
-        echo -e "${C_MUTED}─────────────────────────────────────────────────────────────${RESET}"
-        echo -e "  ${C_PRIMARY}${BOLD}1${RESET}  ${C_MUTED}❯${RESET}  ⚡ ${BOLD}Connetti VPN${RESET}        ${C_MUTED}(seleziona config .ovpn)${RESET}"
-        echo -e "  ${C_PRIMARY}${BOLD}2${RESET}  ${C_MUTED}❯${RESET}  🔌 ${BOLD}Disconnetti VPN${RESET}     ${C_MUTED}(termina processo openvpn)${RESET}"
-        echo -e "  ${C_PRIMARY}${BOLD}3${RESET}  ${C_MUTED}❯${RESET}  📊 ${BOLD}Aggiorna Stato${RESET}      ${C_MUTED}(mostra IP e tunnel)${RESET}"
-        echo -e "  ${C_PRIMARY}${BOLD}4${RESET}  ${C_MUTED}❯${RESET}  📜 ${BOLD}Visualizza Log Live${RESET} ${C_MUTED}(tail -f openvpn.log)${RESET}"
-        echo -e "  ${C_PRIMARY}${BOLD}5${RESET}  ${C_MUTED}❯${RESET}  🚪 ${BOLD}Esci${RESET}"
-        echo -e "${C_MUTED}─────────────────────────────────────────────────────────────${RESET}"
-        read -rp "👉 Seleziona un'opzione [1-5]: " opt
-        case $opt in
+        echo -e "   ${C_ACCENT}[1]${RESET}  ${BOLD}Connect VPN${RESET}        ${C_MUTED}(select .ovpn / .conf profile)${RESET}"
+        echo -e "   ${C_ACCENT}[2]${RESET}  ${BOLD}Disconnect${RESET}         ${C_MUTED}(terminate active tunnel)${RESET}"
+        echo -e "   ${C_ACCENT}[3]${RESET}  ${BOLD}Refresh status${RESET}"
+        echo -e "   ${C_ACCENT}[4]${RESET}  ${BOLD}Live logs${RESET}          ${C_MUTED}(stream / view tunnel logs)${RESET}"
+        echo -e "   ${C_ACCENT}[q]${RESET}  ${BOLD}Quit${RESET}"
+        echo ""
+        read -rsn1 -p " ➜ Select option [1-4, q]: " opt
+        # Read any remaining escape sequence characters if ESC was pressed
+        if [[ "$opt" == $'\e' ]]; then
+            read -rsn2 -t 0.01 _ 2>/dev/null
+        fi
+        echo ""
+        case "$opt" in
             1)
                 start_vpn
-                echo ""
-                read -rp "Premi INVIO per continuare..."
+                wait_key
                 ;;
             2)
                 echo ""
                 stop_vpn
-                echo ""
-                read -rp "Premi INVIO per continuare..."
+                wait_key
                 ;;
             3)
-                # Loop will refresh and display status
+                # Loop will refresh and display updated status immediately
                 ;;
             4)
-                echo ""
                 show_logs
                 ;;
-            5)
-                echo -e "\n${C_SUCCESS}Arrivederci! 👋${RESET}\n"
+            5|[qQ]|x|X|$'\e'*)
                 exit 0
                 ;;
+            "")
+                # Enter pressed without character, refresh
+                ;;
             *)
-                echo -e "${C_DANGER}Opzione non valida!${RESET}"
-                sleep 1
+                echo -e "\n  ${C_DANGER}Invalid option!${RESET}"
+                sleep 0.6
                 ;;
         esac
     done
@@ -327,14 +566,15 @@ case "$1" in
     start|up|connect)
         print_banner
         start_vpn "$2"
+        echo ""
         ;;
     stop|down|disconnect)
         print_banner
         stop_vpn
+        echo ""
         ;;
     status|info)
         print_banner
-        echo ""
         status_vpn
         echo ""
         ;;
@@ -344,20 +584,19 @@ case "$1" in
     restart)
         print_banner
         stop_vpn
+        echo ""
         start_vpn "$2"
+        echo ""
         ;;
     help|--help|-h)
         print_banner
-        echo -e "${C_ACCENT}${BOLD}UTILIZZO RAPIDO${RESET}"
-        echo -e "${C_MUTED}─────────────────────────────────────────────────────────────${RESET}"
-        echo -e "  ${C_PRIMARY}${BOLD}$SCRIPT_NAME${RESET}                     ${C_MUTED}→ Menu interattivo completo${RESET}"
-        echo -e "  ${C_PRIMARY}${BOLD}$SCRIPT_NAME start${RESET}               ${C_MUTED}→ Scegli e avvia un file .ovpn${RESET}"
-        echo -e "  ${C_PRIMARY}${BOLD}$SCRIPT_NAME start file.ovpn${RESET}     ${C_MUTED}→ Avvia direttamente in background${RESET}"
-        echo -e "  ${C_PRIMARY}${BOLD}$SCRIPT_NAME stop${RESET}                ${C_MUTED}→ Disconnette la VPN${RESET}"
-        echo -e "  ${C_PRIMARY}${BOLD}$SCRIPT_NAME status${RESET}              ${C_MUTED}→ Mostra stato, IP tun0 e file attivo${RESET}"
-        echo -e "  ${C_PRIMARY}${BOLD}$SCRIPT_NAME logs${RESET}                ${C_MUTED}→ Mostra i log live del tunnel${RESET}"
-        echo -e "  ${C_PRIMARY}${BOLD}$SCRIPT_NAME restart [file]${RESET}      ${C_MUTED}→ Riavvia la VPN${RESET}"
-        echo -e "${C_MUTED}─────────────────────────────────────────────────────────────${RESET}\n"
+        echo -e "   ${C_PREFIX}${BOLD}$SCRIPT_NAME${RESET}                     ${C_MUTED}→ Full interactive menu${RESET}"
+        echo -e "   ${C_PREFIX}${BOLD}$SCRIPT_NAME start${RESET}               ${C_MUTED}→ Select and launch an .ovpn / .conf profile${RESET}"
+        echo -e "   ${C_PREFIX}${BOLD}$SCRIPT_NAME start file.ovpn${RESET}     ${C_MUTED}→ Launch profile directly${RESET}"
+        echo -e "   ${C_PREFIX}${BOLD}$SCRIPT_NAME stop${RESET}                ${C_MUTED}→ Disconnect active tunnel${RESET}"
+        echo -e "   ${C_PREFIX}${BOLD}$SCRIPT_NAME status${RESET}              ${C_MUTED}→ Show status, IP and active configuration${RESET}"
+        echo -e "   ${C_PREFIX}${BOLD}$SCRIPT_NAME logs${RESET}                ${C_MUTED}→ Stream or inspect tunnel logs${RESET}"
+        echo -e "   ${C_PREFIX}${BOLD}$SCRIPT_NAME restart [file]${RESET}      ${C_MUTED}→ Restart the tunnel${RESET}\n"
         ;;
     *)
         interactive_menu
