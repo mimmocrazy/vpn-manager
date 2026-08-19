@@ -270,38 +270,66 @@ stop_vpn() {
 }
 
 start_vpn() {
-    local config_file="$1"
+    local config_arg="$1"
+    local config_file=""
 
-    # If no config provided, show a styled picker of .ovpn & .conf files
-    if [ -z "$config_file" ]; then
-        local search_dirs=()
-        for d in "$REAL_HOME/VPNs" "$REAL_HOME/vpns" "$REAL_HOME/vpn" "$REAL_HOME/VPN" "$REAL_HOME/OpenVPN" "$REAL_HOME/wireguard" "$REAL_HOME/WireGuard" "$VPN_DIR" "/etc/wireguard" "$(pwd)" "$SCRIPT_DIR"; do
-            if [ -d "$d" ]; then
-                search_dirs+=("$d")
-            fi
-        done
-
-        mapfile -t all_files < <(
-            for d in "${search_dirs[@]}"; do
-                find "$d" -maxdepth 2 \( -name "*.ovpn" -o -name "*.conf" \) -printf "%p\n" 2>/dev/null
-            done | sort -u
-        )
-
-        # Filter valid VPN config files
-        local valid_files=()
-        for f in "${all_files[@]}"; do
-            if [[ "$f" == *.ovpn ]]; then
-                valid_files+=("$f")
-            elif is_wireguard_file "$f"; then
-                valid_files+=("$f")
-            fi
-        done
-        
-        if [ ${#valid_files[@]} -eq 0 ]; then
-            echo -e "\n  ${C_DANGER}✖${RESET} No VPN files (.ovpn / .conf) found in: ${BOLD}$(format_path "$VPN_DIR")${RESET}\n"
-            return 1
+    local search_dirs=()
+    for d in "$REAL_HOME/VPNs" "$REAL_HOME/vpns" "$REAL_HOME/vpn" "$REAL_HOME/VPN" "$REAL_HOME/OpenVPN" "$REAL_HOME/wireguard" "$REAL_HOME/WireGuard" "$VPN_DIR" "/etc/wireguard" "$(pwd)" "$SCRIPT_DIR"; do
+        if [ -d "$d" ]; then
+            search_dirs+=("$d")
         fi
+    done
 
+    mapfile -t all_files < <(
+        for d in "${search_dirs[@]}"; do
+            find "$d" -maxdepth 2 \( -name "*.ovpn" -o -name "*.conf" \) -printf "%p\n" 2>/dev/null
+        done | sort -u
+    )
+
+    # Filter valid VPN config files
+    local valid_files=()
+    for f in "${all_files[@]}"; do
+        if [[ "$f" == *.ovpn ]]; then
+            valid_files+=("$f")
+        elif is_wireguard_file "$f"; then
+            valid_files+=("$f")
+        fi
+    done
+
+    if [ ${#valid_files[@]} -eq 0 ]; then
+        echo -e "\n  ${C_DANGER}✖${RESET} No VPN files (.ovpn / .conf) found in: ${BOLD}$(format_path "$VPN_DIR")${RESET}\n"
+        return 1
+    fi
+
+    # 1. Direct index matching (e.g. `vpn connect 3`)
+    if [[ "$config_arg" =~ ^[0-9]+$ ]]; then
+        local idx=$((config_arg - 1))
+        if [ "$idx" -ge 0 ] && [ "$idx" -lt "${#valid_files[@]}" ]; then
+            config_file="${valid_files[$idx]}"
+        fi
+    fi
+
+    # 2. File / pattern / substring matching (e.g. `vpn connect machines`)
+    if [ -z "$config_file" ] && [ -n "$config_arg" ]; then
+        if [ -f "$config_arg" ]; then
+            config_file="$config_arg"
+        else
+            for f in "${valid_files[@]}"; do
+                local fname
+                fname="$(basename "$f")"
+                if [[ "$fname" == "$config_arg" || "$fname" == "$config_arg.ovpn" || "$fname" == "$config_arg.conf" || "$fname" == *"$config_arg"* ]]; then
+                    config_file="$f"
+                    break
+                fi
+            done
+        fi
+    fi
+
+    # 3. If no config provided or match not found, show interactive menu
+    if [ -z "$config_file" ]; then
+        if [ -n "$config_arg" ]; then
+            echo -e "\n  ${C_DANGER}✖${RESET} Configuration '${config_arg}' not found. Select from list:"
+        fi
         echo -e "\n ${C_PREFIX}::${RESET} ${BOLD}Available configurations${RESET} ${C_MUTED}($(format_path "$VPN_DIR"))${RESET}:\n"
         for i in "${!valid_files[@]}"; do
             local fn proto_badge
@@ -330,35 +358,6 @@ start_vpn() {
         fi
 
         config_file="${valid_files[$((choice-1))]}"
-    fi
-
-    # Resolve file path with smart fallbacks (.ovpn, .conf extensions, candidate dirs, PWD)
-    if [ ! -f "$config_file" ]; then
-        if [ -f "$config_file.ovpn" ]; then
-            config_file="$config_file.ovpn"
-        elif [ -f "$config_file.conf" ]; then
-            config_file="$config_file.conf"
-        else
-            local found=""
-            for d in "$REAL_HOME/VPNs" "$REAL_HOME/vpns" "$REAL_HOME/vpn" "$REAL_HOME/VPN" "$REAL_HOME/OpenVPN" "$REAL_HOME/wireguard" "$REAL_HOME/WireGuard" "$VPN_DIR" "/etc/wireguard" "$(pwd)" "$SCRIPT_DIR"; do
-                if [ -f "$d/$config_file" ]; then
-                    found="$d/$config_file"
-                    break
-                elif [ -f "$d/$config_file.ovpn" ]; then
-                    found="$d/$config_file.ovpn"
-                    break
-                elif [ -f "$d/$config_file.conf" ]; then
-                    found="$d/$config_file.conf"
-                    break
-                fi
-            done
-            if [ -n "$found" ]; then
-                config_file="$found"
-            else
-                echo -e "\n  ${C_DANGER}✖${RESET} Configuration file not found: ${BOLD}$config_file${RESET}\n"
-                return 1
-            fi
-        fi
     fi
 
     local proto
